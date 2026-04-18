@@ -19,6 +19,9 @@
 4. 做完每章自测（题目 + 标准答案都在章节末尾）
 5. 最后做综合验收：`Study/chapters/99_final_assessment.md`
 
+专题补充：
+- `Study/agent_harness_architecture_reuse_playbook.md`：从架构与设计思路层面总结 OpenHarness，并给出面向下一个 Agent 项目的复用方案
+
 ## 练习脚本怎么跑
 
 约定：从仓库根目录运行（也就是本项目目录），例如：
@@ -39,4 +42,3 @@ Study/
   chapters/               # 每章资料（Markdown）
   exercises/              # 每章最小可运行代码（Python）
 ```
-
