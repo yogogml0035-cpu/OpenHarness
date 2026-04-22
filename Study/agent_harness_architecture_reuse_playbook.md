@@ -1,839 +1,573 @@
-# OpenHarness 架构总结与 Agent 项目复用手册
+# Agent Harness 设计方法论知识资产
 
-> 目的：把当前项目沉淀成一份可复用的“知识资产”，既帮助理解 OpenHarness，也帮助下一个 Agent 项目快速落地。  
-> 更新时间：2026-04-18  
-> 适用场景：阅读 OpenHarness 架构、抽取可复用设计模式、设计“多份投标文件 Markdown 审查 Agent”。
+> 目的：从本项目中提炼可迁移的 Agent 系统设计方法，而不是复述实现或编写项目说明书。  
+> 抽象层级：保留模块职责、关键协作关系和设计取舍，去掉参数、字段、敏感配置和强项目绑定细节。  
+> 适用对象：后续需要设计可执行、可治理、可扩展、可长期运行的 Agent 项目。
 
-## 1. 先用一句话看懂 OpenHarness
+## 1. 这个架构真正解决的问题
 
-OpenHarness 不是某个具体业务 Agent，而是一个 **Agent Harness**：
+很多 Agent 项目的失败点不在模型不够强，而在“模型周围没有足够可靠的运行底座”：
 
-- 模型负责决定“下一步做什么”
-- Harness 负责提供“怎么做”的基础设施
-- 这套基础设施包括：tool loop、权限、hooks、MCP、session、memory、UI、tasks、multi-agent
+- 模型能想，但不能安全、稳定、可审计地执行。
+- 工具很多，但缺少统一契约，最后变成不可测试的 prompt 拼接。
+- 上下文越来越长，但状态没有沉淀，长任务一压缩就丢失关键线索。
+- 能力扩展靠改主流程，导致工具、知识、权限、UI、外部服务互相缠绕。
+- 多 Agent 很早引入，但任务边界、证据交接和失败处理没有设计，协作反而放大噪声。
 
-从这个角度看，OpenHarness 更像一个“Agent 操作系统”或“Agent 运行底座”，而不是一个只会聊天的 Bot。
+本项目的核心方法论可以概括为：
 
-这也是它最值得复用的地方。
+> 把 LLM 放在“决策与解释”的位置，把 Harness 放在“执行、治理、记忆、扩展、观察”的位置。
 
-## 2. 这个项目的真实主干架构
+也就是说，Agent 项目不要只问“模型如何回答”，而要先设计：
 
-如果只抓主干，可以把 OpenHarness 理解成 6 层：
+- 模型可以看到什么。
+- 模型可以请求什么动作。
+- 哪些动作必须被系统拦截、校验、记录或转交。
+- 哪些状态必须离开聊天记录，变成可恢复、可复核的系统状态。
+- 哪些能力应该是内置工具，哪些应该是外部适配器，哪些只是按需加载的知识。
 
-1. 入口层：CLI / TUI / 应用启动
-2. 运行时装配层：把 settings、provider、tools、hooks、MCP、engine 拼起来
-3. Agent Loop 层：模型流式输出、识别 tool call、执行工具、回填结果
-4. 能力层：tools / permissions / hooks / MCP / tasks
-5. 状态层：session、compaction、memory、resume
-6. 交互层：React TUI、bridge、channels、ohmo
+## 2. 总体设计思想：模型决策与系统执行分离
 
-### 2.1 最重要的源码锚点
+项目最值得迁移的设计不是某个具体工具，而是职责边界。
 
-- 运行时装配：[src/openharness/ui/runtime.py](../src/openharness/ui/runtime.py)
-- 会话入口：[src/openharness/engine/query_engine.py](../src/openharness/engine/query_engine.py)
-- 核心循环：[src/openharness/engine/query.py](../src/openharness/engine/query.py)
-- 工具契约：[src/openharness/tools/base.py](../src/openharness/tools/base.py)
-- 默认工具注册：[src/openharness/tools/__init__.py](../src/openharness/tools/__init__.py)
-- 权限控制：[src/openharness/permissions/checker.py](../src/openharness/permissions/checker.py)
-- Hook 执行器：[src/openharness/hooks/executor.py](../src/openharness/hooks/executor.py)
-- MCP 接入：[src/openharness/mcp/client.py](../src/openharness/mcp/client.py)
-- 后台任务：[src/openharness/tasks/manager.py](../src/openharness/tasks/manager.py)
-- 自动压缩：[src/openharness/services/compact/__init__.py](../src/openharness/services/compact/__init__.py)
-- 会话持久化：[src/openharness/services/session_storage.py](../src/openharness/services/session_storage.py)
-- 前后端协议：[src/openharness/ui/protocol.py](../src/openharness/ui/protocol.py)
-- 系统提示组装：[src/openharness/prompts/system_prompt.py](../src/openharness/prompts/system_prompt.py)
-- 配置系统：[src/openharness/config/settings.py](../src/openharness/config/settings.py)
+模型负责：
 
-### 2.2 运行流程图
+- 理解用户意图。
+- 规划下一步。
+- 选择工具。
+- 阅读工具结果。
+- 解释进展和产出结论。
+
+Harness 负责：
+
+- 组装运行时依赖。
+- 暴露工具契约。
+- 校验工具输入。
+- 执行权限策略。
+- 触发生命周期治理。
+- 记录会话、任务、压缩和恢复状态。
+- 把外部服务适配成统一能力。
+- 向不同 UI 或消息渠道输出事件。
+
+这个拆分带来的直接收益是：
+
+- 安全边界不依赖模型自觉。
+- 工具失败可以被系统显式表达，而不是混在自然语言里。
+- 核心流程可以被测试，外部能力可以被替换。
+- 更换模型、UI、渠道、工具来源时，不需要重写 Agent 的运行逻辑。
+
+## 3. 可迁移的模块拆分方法
+
+下面的模块不是项目目录清单，而是 Agent 系统中可复用的职责分层。
+
+| 模块 | 解决的问题 | 设计原因 | 可迁移经验 |
+| --- | --- | --- | --- |
+| Runtime 装配层 | 初始化散落、依赖关系不清 | 把模型客户端、配置、工具、权限、hooks、MCP、会话和 UI 状态集中装配 | 为每个 Agent 项目设置一个 composition root，其他模块只接收已装配好的依赖 |
+| Agent Loop 层 | 模型输出与工具执行难以闭环 | 用事件化循环承接“模型请求工具、系统执行、结果回填、模型继续判断” | 把 Agent 视为状态机，而不是一次性问答函数 |
+| Tool 能力层 | 动作边界模糊、输入不可控 | 工具必须有名称、说明、结构化输入、执行结果和只读语义 | 先设计工具契约，再设计 prompt |
+| Governance 层 | 权限和审计混入业务逻辑 | 权限检查与 hooks 独立于工具实现 | 策略不要写死在 prompt 或工具内部，应作为横切治理面 |
+| Context 与 Memory 层 | 长任务丢状态、恢复困难 | 将会话、近期工作、压缩检查点、持久记忆分层保存 | 聊天记录不是数据库，关键状态必须外化 |
+| Extension 层 | 扩展能力需要改核心代码 | Skills、plugins、MCP 等通过统一入口注入能力 | 区分知识扩展、动作扩展、流程扩展和外部服务扩展 |
+| Task 与 Multi-Agent 层 | 长耗时任务阻塞对话，多 Agent 缺少生命周期 | 后台任务、子 Agent、团队协作都需要状态、输出和终止机制 | 多 Agent 不是聊天群，而是带边界的任务执行网络 |
+| Interaction 层 | CLI、TUI、远程渠道各自实现一套 Agent | UI 和消息渠道只处理输入输出，核心运行时保持共享 | 把传输层和推理执行层拆开，避免渠道绑定业务逻辑 |
+| Provider 与 Config 层 | 模型供应商差异污染核心流程 | 通过 provider/profile/settings 归一化模型、鉴权和默认行为 | 模型供应商是边缘适配问题，不应成为业务核心分支 |
+
+## 4. 关键协作关系
+
+### 4.1 一次 Agent 行动的标准链路
 
 ```mermaid
 flowchart TD
-    U["User"] --> CLI["CLI / React TUI"]
-    CLI --> RT["build_runtime()"]
-    RT --> CFG["Settings / Provider / Prompt"]
-    RT --> MCP["MCP Manager"]
-    RT --> TOOLS["ToolRegistry"]
-    RT --> HOOKS["HookExecutor"]
-    RT --> ENGINE["QueryEngine"]
-
-    ENGINE --> LOOP["run_query()"]
-    LOOP --> MODEL["LLM stream_message()"]
-    MODEL --> MSG["Assistant message / tool_use"]
-    MSG -->|no tool| OUT["Assistant response"]
-    MSG -->|tool_use| EXEC["execute_tool_call()"]
-    EXEC --> PERM["PermissionChecker"]
-    EXEC --> HOOK["Pre / Post hooks"]
-    EXEC --> TOOL["BaseTool.execute()"]
-    TOOL --> TR["tool_result"]
-    TR --> LOOP
-
-    LOOP --> COMPACT["Auto compact / session carryover"]
-    LOOP --> SAVE["Session snapshot / resume"]
+    U["用户输入"] --> I["交互层"]
+    I --> R["Runtime 装配层"]
+    R --> E["Agent Loop"]
+    E --> M["模型客户端"]
+    M -->|普通文本| O["输出事件"]
+    M -->|工具请求| T["Tool Registry"]
+    T --> V["结构化输入校验"]
+    V --> P["权限策略"]
+    P --> H1["Pre hooks"]
+    H1 --> X["工具执行"]
+    X --> H2["Post hooks"]
+    H2 --> S["状态与观察记录"]
+    S --> E
 ```
 
-## 3. OpenHarness 最值得复用的设计思路
+这条链路的设计重点不是“工具怎么执行”，而是每个环节都有独立责任：
 
-### 3.1 把“模型决策”与“系统执行”拆开
+- Agent Loop 不关心工具来源，只关心工具是否符合统一契约。
+- 工具不决定自己是否被允许执行，权限层统一判断。
+- hooks 不承担主业务，只负责拦截、审计、旁路验证或通知。
+- 状态层记录的是可恢复信息，而不是把所有细节塞回 prompt。
 
-这是本项目最核心的工程思想。
+### 4.2 能力注入的协作关系
 
-- 模型只负责规划、选择工具、解释结果
-- 系统负责权限、执行、日志、重试、状态、持久化
+```mermaid
+flowchart LR
+    C["配置与环境"] --> R["Runtime"]
+    K["Skills"] --> R
+    G["Plugins"] --> R
+    N["MCP 外部服务"] --> A["Tool Adapter"]
+    A --> TR["Tool Registry"]
+    R --> TR
+    TR --> L["Agent Loop"]
+```
 
-好处是：
+这里的关键原则是“能力可以来自不同地方，但进入核心循环前必须被归一化”。  
+本地工具、插件工具和外部 MCP 工具在执行链路里不应拥有不同特权，否则治理和测试都会失效。
 
-- 更安全：模型不能直接越过权限系统
-- 更稳定：工具执行失败时可以被系统显式处理
-- 更可测试：工具、权限、状态都能单独测试
-- 更可迁移：换模型、不换业务执行底座
-
-### 3.2 Runtime 统一装配，而不是散落初始化
-
-`build_runtime()` 做了非常正确的一件事：把 provider、MCP、tools、hooks、engine、commands 在一个地方组装起来。
-
-这意味着：
-
-- 系统边界清楚
-- 测试替身容易注入
-- 新能力可插拔
-
-这对任何 Agent 项目都非常重要。不要把“工具注册、模型配置、向量库连接、规则引擎初始化”分散在 12 个文件里。
-
-### 3.3 Tool 是一等公民，且必须是 schema-first
-
-OpenHarness 的工具抽象非常干净：
-
-- `name`
-- `description`
-- `input_model`
-- `execute()`
-- `is_read_only()`
-
-这说明一个成熟 Agent 系统，重点不是 prompt 花活，而是：
-
-- 工具边界清不清楚
-- 输入 schema 严不严
-- 输出是否结构化
-- 是否可审计
-
-对你的下一个项目来说，这一点尤其关键，因为“串标围标检查”不能只靠一段 prompt 让模型自由发挥。
-
-### 3.4 权限与业务逻辑分层
-
-`PermissionChecker` 和业务工具是分开的，这非常值得抄。
-
-以后做“投标文件审查 Agent”时，也应该把下面几类约束独立出来：
-
-- 文件/数据访问权限
-- 敏感字段访问权限
-- 是否允许外网搜索
-- 是否允许写结论性报告
-- 是否必须人工复核后才能导出正式结论
-
-也就是说，**合规策略不要揉进工具实现里，更不要只揉进 prompt 里**。
-
-### 3.5 Hook 是治理面，不是业务面
-
-OpenHarness 的 hooks 适合做：
-
-- 审计
-- 拦截
-- 通知
-- 额外检查
-- 旁路验证
-
-以后你的项目也应该保留这一层，例如：
-
-- 在生成“高风险疑似串标”结论前自动触发二次校验
-- 在导出报告前写审计日志
-- 在模型使用某些敏感证据时记录 trace
-
-### 3.6 背景任务与对话循环解耦
-
-`BackgroundTaskManager` 的价值很大：有些事情不该堵在前台对话里。
-
-例如：
-
-- 大批量文档解析
-- 大规模相似度计算
-- 向量索引构建
-- 全量 pairwise compare
-- OCR / 表格抽取 / 元数据抽取
-
-这些更适合变成异步任务，Agent 只负责：
-
-- 发起任务
-- 查询任务状态
-- 读取任务结果
-- 基于结果继续调查
-
-### 3.7 长上下文不是靠“把所有材料都塞给模型”
-
-OpenHarness 的 compaction 设计说明了一个现实：
-
-- 真正可用的 Agent 必须会处理长会话
-- 处理方式不是无限堆上下文
-- 而是 checkpoint、summary、carryover、resume
-
-做投标审查时更要注意：
-
-- 文档多
-- 比对链路长
-- 证据反复引用
-
-所以一定要做“状态对象”和“证据对象”，不要把系统状态全塞在聊天记录里。
-
-### 3.8 MCP / Adapter 模式很适合企业化接入
-
-OpenHarness 通过 `McpClientManager + McpToolAdapter` 把外部能力接入成“像本地工具一样的工具”。
-
-这对下一个项目很有价值：
-
-- OCR 服务
-- 企业知识库
-- 招采系统
-- 风险规则引擎
-- 图数据库查询服务
-- 相似度计算服务
-
-都可以优先考虑封成 MCP 或统一 Tool API，而不是把所有逻辑写死在主进程里。
-
-## 4. 这个项目给下一个 Agent 项目的最大启发
-
-### 4.1 不要直接做“聊天式投标审查”
-
-你的目标不应该是：
-
-> “上传几份 markdown，让模型聊聊像不像串标围标。”
-
-更合理的目标应该是：
-
-> “构建一个证据驱动的调查系统，Agent 负责规划与解释，工具负责抽取、对比、检索、评分、归档。”
-
-这两者差别非常大。
-
-前者是 Demo。
-后者才是能落地的系统。
-
-### 4.2 不要让 LLM 单独产出最终法律式判断
-
-“串标围标”是高风险判断，建议系统输出的是：
-
-- 可疑线索
-- 证据链
-- 风险等级
-- 不确定性说明
-- 建议人工复核点
-
-而不是直接替代法务/审标专家做最终定性。
-
-建议系统最终结论使用这类措辞：
-
-- `未发现明显异常`
-- `发现需复核的相似性线索`
-- `发现中风险可疑关联`
-- `发现高风险可疑关联，建议人工复核`
-
-而不是简单输出“是/否串标围标”。
-
-## 5. 你下一个项目应该怎么设计
-
-### 5.1 推荐的总体架构
+### 4.3 长任务与多 Agent 的协作关系
 
 ```mermaid
 flowchart TD
-    A["Upload Markdown + Source Metadata"] --> B["Document Ingestion"]
-    B --> C["Normalization / Chunking / Indexing"]
-    C --> D["Structured Extraction"]
-    C --> E["Embeddings / Similarity Fingerprints"]
-    C --> F["Metadata Preservation"]
-    D --> G["Evidence Graph / Fact Store"]
-    E --> G
-    F --> G
-    G --> H["Detection Tools"]
-    H --> I["Agent Orchestrator"]
-    I --> J["Case Report / Evidence Matrix"]
-    I --> K["Human Review"]
-    K --> L["Final Export / Audit Log"]
+    L["主 Agent"] --> Q["任务管理器"]
+    Q --> B["后台任务"]
+    Q --> A["子 Agent"]
+    B --> O["输出与状态"]
+    A --> O
+    O --> L
+    L --> R["用户可见进展或最终结果"]
 ```
 
-建议拆成 4 个子系统：
+这类协作的重点是主 Agent 保持最终控制权：
 
-1. 文档与证据底座
-2. 检查工具层
-3. Agent 编排层
-4. 报告与复核层
+- 子任务要有明确目标和边界。
+- 子任务输出要能被主 Agent 消化，而不是直接替代主 Agent 决策。
+- 长耗时工作要能查询、停止、恢复或读取尾部输出。
+- 多 Agent 的价值来自并行和专业化，不来自“让多个模型自由讨论”。
 
-### 5.2 四个子系统分别做什么
+### 4.4 渠道与运行时的协作关系
 
-#### A. 文档与证据底座
-
-负责把上传的 Markdown 变成可检索、可比对、可追溯的结构。
-
-至少要有：
-
-- 原文存储
-- 文档切片
-- bidder / 包号 / 标段 / 文件类型等元数据
-- 抽取后的结构化实体
-- 相似度索引
-- 审计日志
-
-#### B. 检查工具层
-
-负责把“可疑性判断”拆成独立工具，不让模型直接凭空想。
-
-建议工具类别：
-
-- 文档搜索：按 bidder、章节、关键词检索
-- 实体抽取：联系人、电话、邮箱、地址、银行账号、报价、日期、品牌、规格
-- 片段比对：段落级/表格级/章节级相似度
-- 指纹比对：n-gram、模板结构、罕见错别字、格式模式
-- 数值规则：报价梯度、尾数规律、极小价差、轮廓异常
-- 图查询：共享联系人、共享地址、共享银行账户、共享模板片段
-- 证据归档：把线索沉淀成 case/evidence
-- 报告生成：只基于已归档证据生成结论
-
-#### C. Agent 编排层
-
-负责调查流程，而不是做重计算。
-
-Agent 的职责应该是：
-
-- 先规划检查路径
-- 调工具拿证据
-- 发现冲突时回查
-- 组织 case
-- 生成带证据引用的结论
-
-不要让 Agent 自己：
-
-- 扫全库做 O(n²) 重比对
-- 每次临时计算全部 embedding
-- 每次重复抽取所有结构化字段
-
-这些应该前置成任务或离线处理。
-
-#### D. 报告与复核层
-
-最终应该输出：
-
-- 风险摘要
-- 证据矩阵
-- 每条证据的来源位置
-- 模型判断依据
-- 规则引擎命中的规则
-- 不确定性与缺失信息
-- 审核人复核入口
-
-### 5.3 一个真正可落地的数据模型
-
-建议至少定义这些核心对象：
-
-### DocumentRecord
-
-- `doc_id`
-- `project_id`
-- `bidder_id`
-- `document_type`
-- `source_filename`
-- `source_sha256`
-- `upload_time`
-- `markdown_text`
-- `source_metadata`
-
-### SectionChunk
-
-- `chunk_id`
-- `doc_id`
-- `section_path`
-- `text`
-- `token_count`
-- `embedding_id`
-- `fingerprints`
-
-### ExtractedFact
-
-- `fact_id`
-- `doc_id`
-- `bidder_id`
-- `fact_type`
-- `value`
-- `normalized_value`
-- `source_chunk_id`
-- `confidence`
-
-### EvidenceItem
-
-- `evidence_id`
-- `case_id`
-- `evidence_type`
-- `left_ref`
-- `right_ref`
-- `score`
-- `why_it_matters`
-- `raw_metrics`
-
-### SuspicionCase
-
-- `case_id`
-- `project_id`
-- `bidders_involved`
-- `risk_level`
-- `status`
-- `evidence_ids`
-- `review_notes`
-
-### 5.4 一个更适合该场景的工作流
-
-推荐使用“预处理 + 调查”双阶段：
-
-### 阶段 1：预处理
-
-- 上传 Markdown
-- 保存原文和元数据
-- 切 chunk
-- 做实体抽取
-- 做 embedding
-- 做模板/文本/报价等初步指纹
-- 生成候选可疑 pair
-
-### 阶段 2：调查
-
-- Agent 接到“检查某个项目是否存在串标围标风险”
-- 先读取候选 pair
-- 对高风险 pair 调用更细的对比工具
-- 把证据存成 case
-- 由报告工具基于 case 生成结论
-
-这样做的好处是：
-
-- 前台响应快
-- 成本可控
-- 证据结构稳定
-- 更容易做审计和复核
-
-### 5.5 这个场景最容易被忽略的一个点
-
-如果你只上传“Markdown 文本”，很多高价值线索可能已经丢了：
-
-- 原始文件作者信息
-- 生成器/模板信息
-- PDF / Word 元数据
-- 附件层级
-- 表格布局痕迹
-- 提交时间与上传路径
-
-所以推荐上传协议至少包含两部分：
-
-1. Markdown 正文
-2. sidecar metadata
-
-例如：
-
-```json
-{
-  "project_id": "P-2026-001",
-  "bidder_id": "BIDDER_A",
-  "document_type": "technical_bid",
-  "source_filename": "A_company_technical.docx",
-  "source_file_type": "docx",
-  "source_sha256": "...",
-  "source_metadata": {
-    "author": "...",
-    "created_at": "...",
-    "last_modified_at": "...",
-    "template": "...",
-    "pages": 32
-  },
-  "markdown_text": "..."
-}
+```mermaid
+flowchart LR
+    CH["聊天渠道 / CLI / TUI"] --> B["消息桥接与路由"]
+    B --> RP["会话运行时池"]
+    RP --> E["共享 Agent Engine"]
+    E --> B
+    B --> CH
 ```
 
-这一步非常重要，否则很多“共享模板/共享作者/共享生成路径”的线索会永久消失。
+这种拆分让同一个 Agent 内核可以服务不同入口：
 
-## 6. 推荐的 Agent 结构：先单 Agent，后多 Agent
+- CLI 面向本地开发。
+- TUI 面向交互控制。
+- 远程聊天渠道面向长期陪伴和异步协作。
 
-### 6.1 V1 不建议一开始就上复杂多 Agent
+入口变化不应该改变 Agent 的工具治理、记忆策略和执行语义。
 
-更推荐：
+## 5. 重要设计原则与决策逻辑
 
-- 一个主调查 Agent
-- 一组强工具
-- 一个结构化 evidence store
-- 一个独立 report builder
+### 5.1 Tool-first，而不是 prompt-first
 
-原因很简单：
+当一个能力满足任意条件时，应优先设计为工具：
 
-- 这个场景的难点首先是“证据抽取与比对”
-- 不是“让很多 Agent 聊天协作”
+- 需要访问外部系统。
+- 需要读写文件或执行命令。
+- 需要结构化输入输出。
+- 需要权限控制或审计。
+- 会被多次复用。
+- 失败需要明确表达。
 
-如果工具层不稳，多 Agent 只会放大噪声。
+Prompt 适合处理理解、规划、归纳和解释。  
+Tool 适合处理动作、检索、计算、验证和持久化。
 
-### 6.2 什么时候升级到多 Agent
+一个成熟 Agent 项目的核心不是“更长的系统提示词”，而是“更清晰的动作表面”。
 
-当下面三件事已经稳定后，再考虑多 Agent：
+### 5.2 Policy-outside-business
 
-1. 文档抽取准确率稳定
-2. 证据对象模型稳定
-3. 单 Agent 可以稳定完成一条案件链路
+权限、敏感路径保护、命令限制、人工确认、审计记录，都不应该散落在业务工具中。  
+这些能力属于治理面，应该围绕工具执行链路统一生效。
 
-这时再拆成：
+这样做的原因是：
 
-- `planner_agent`：决定调查顺序
-- `extraction_agent`：抽证据
-- `comparison_agent`：做相似性/规则分析
-- `review_agent`：检查证据是否充分
-- `report_agent`：只负责写报告
+- 工具作者不必重复实现安全规则。
+- 新工具上线后自动继承基础治理。
+- 策略可以按模式切换，例如计划、默认、自动执行。
+- 审计和安全测试有稳定入口。
 
-我更推荐的模式是：
+迁移到其他 Agent 项目时，可以把治理面设计为“所有动作的前置门”和“所有结果的后置观察点”。
 
-- **manager 保持最终控制权**
-- specialist 只做有边界的子任务
+### 5.3 Runtime 作为组合根
 
-这和 OpenHarness 的 tool / agent / task 分层是一致的。
+Runtime 的价值在于把系统复杂性收拢到一个装配边界：
 
-## 7. 工具层应该怎么设计
+- 读取配置。
+- 解析当前工作区。
+- 建立模型客户端。
+- 加载插件与技能。
+- 连接外部服务。
+- 注册工具。
+- 创建权限检查器。
+- 创建 hooks 执行器。
+- 建立会话状态。
+- 生成系统提示。
 
-### 7.1 先做“可复用工具”，不要先写“万能 prompt”
+其他模块不需要知道这些对象如何创建，只需要依赖稳定接口。  
+这降低了测试难度，也避免了“每个入口各自初始化一套不一致运行时”的问题。
 
-建议优先落地这些工具：
+### 5.4 统一工具契约吸收异构能力
 
-### 检索类
+本地工具、外部 MCP 服务、插件扩展、后台任务入口，本质都可以被抽象成“模型可请求的能力”。  
+关键是进入核心循环前统一为同一种工具契约：
 
-- `search_chunks(project_id, keyword, bidder_id?, top_k?)`
-- `search_similar_chunks(chunk_id, top_k?)`
-- `list_project_documents(project_id)`
+- 能被模型发现。
+- 能被 schema 描述。
+- 能被输入校验。
+- 能被权限层拦截。
+- 能产生规范化结果。
+- 能进入相同的事件与日志链路。
 
-### 抽取类
+这是一种强迁移经验：不要让外部服务直接侵入 Agent Loop。  
+先适配，再注册，再统一治理。
 
-- `extract_bid_entities(doc_id, schema_name)`
-- `extract_bid_prices(doc_id)`
-- `extract_contacts(doc_id)`
+### 5.5 长上下文治理要分层
 
-### 比对类
+长任务不能只依赖上下文窗口。更稳妥的做法是把状态分成多层：
 
-- `compare_documents(doc_a, doc_b, mode)`
-- `compare_sections(section_a, section_b)`
-- `compare_price_patterns(project_id)`
+- 当前对话：保留模型正在处理的近期上下文。
+- 工具观察：记录最近读过、改过、验证过的关键事实。
+- 会话快照：支持恢复和继续。
+- 压缩摘要：在上下文过长时保留任务骨架。
+- 持久记忆：保存跨会话仍然有价值的偏好、规则或项目知识。
 
-### 图谱类
+判断逻辑：
 
-- `query_shared_entities(project_id, entity_type, value?)`
-- `find_bidder_links(project_id, bidder_a, bidder_b)`
+- 临时推理材料留在对话中。
+- 后续步骤会依赖的事实进入 carryover 状态。
+- 跨轮次或跨天任务需要会话快照。
+- 跨项目或长期偏好才进入持久记忆。
 
-### 证据管理类
+### 5.6 Hooks 是治理面，不是业务主流程
 
-- `create_case(project_id, bidders)`
-- `append_evidence(case_id, evidence_payload)`
-- `list_case_evidence(case_id)`
+Hooks 适合做横切能力：
 
-### 报告类
+- 工具调用前的阻断。
+- 工具调用后的审计。
+- 风险提示。
+- 旁路验证。
+- 通知和外部同步。
 
-- `generate_case_report(case_id, format)`
+Hooks 不适合承载主业务逻辑。  
+如果一个 hook 开始决定业务流程本身，就应该考虑把它提升为显式工具、命令或服务。
 
-### 7.2 工具输出必须结构化
+### 5.7 Skills 与 Plugins 的不同定位
 
-不要让工具只返回一大段自然语言。
+Skills 是“按需知识”。  
+适合放置领域规则、操作手册、风格指南、排错流程和人类经验。
 
-更推荐返回：
+Plugins 是“可打包扩展”。  
+适合组合命令、技能、hooks、agent 定义和外部服务配置。
 
-- 结构化字段
-- 原文引用
-- 来源 chunk/doc
-- 数值分数
-- 可疑原因标签
+可迁移决策：
 
-例如：
+- 只是告诉 Agent 如何做，用 skill。
+- 要提供新的动作，用 tool。
+- 要绑定一组能力并分发，用 plugin。
+- 要接入外部系统，用 MCP 或工具适配器。
+- 要改变生命周期行为，用 hook。
 
-```json
-{
-  "match_score": 0.91,
-  "evidence_type": "paragraph_similarity",
-  "left": {
-    "doc_id": "doc_a",
-    "section_path": "3.2.1",
-    "excerpt": "......"
-  },
-  "right": {
-    "doc_id": "doc_b",
-    "section_path": "3.2.1",
-    "excerpt": "......"
-  },
-  "why_flagged": "罕见术语与句式高度重合"
-}
-```
+### 5.8 先单 Agent 稳定，再引入多 Agent
 
-这样 Agent 更容易推理，也更容易审计。
+多 Agent 不是架构起点，而是扩展手段。  
+在工具契约、状态模型、验证方式还不稳定时，多 Agent 通常会放大不确定性。
 
-## 8. 推荐的实现路径
+适合引入多 Agent 的条件：
 
-### 8.1 一个务实的 V1
+- 子任务可以独立完成。
+- 输出格式能被主 Agent 验收。
+- 任务之间写入边界清楚。
+- 失败可以被隔离。
+- 并行能显著缩短耗时或提高质量。
 
-建议 V1 先做成：
+不适合引入多 Agent 的情况：
 
-- Web API + 后台任务
-- 文档上传与预处理
-- evidence store
-- 单调查 Agent
-- 报告导出
+- 只是因为任务看起来复杂。
+- 需要多个 Agent 共同猜测需求。
+- 核心证据还没有结构化。
+- 子任务结果无法验证。
 
-先不要做：
+### 5.9 交互层应事件化，而不是直接拼字符串
 
-- 复杂实时聊天 UI
-- 过多多 Agent
-- 过早全自动外网搜证
-- 过度“类人”对话体验
+Agent 的执行过程中会出现多种事件：
 
-先把“证据闭环”做出来。
+- 模型文本增量。
+- 工具开始。
+- 工具完成。
+- 权限请求。
+- 压缩进度。
+- 任务状态。
+- 错误。
+- 最终完成。
 
-### V1 的验收标准
+如果 UI 或渠道直接等待一个完整字符串，就会丢失交互性和可观察性。  
+事件化协议让 CLI、TUI、远程聊天渠道可以共享同一个核心运行时，同时按照各自能力展示进度、审批和结果。
 
-- 能上传多份 markdown
-- 能输出候选风险 pair
-- 能把关键相似片段和共享实体列出来
-- 能给出带引用的风险摘要
-- 能保存调查过程和最终 case
+### 5.10 Provider 是边界适配，不是核心架构
 
-### 8.2 V2 再补强
+不同模型供应商会带来鉴权、消息格式、工具调用格式、流式事件和默认模型的差异。  
+这些差异应该被 provider adapter 吸收，核心引擎只面对统一的 streaming message 能力。
 
-V2 可以再加：
+迁移原则：
 
-- 人工复核工作台
-- 多 Agent 专家分工
-- 更细的图数据库查询
-- 更多规则引擎
-- 项目级历史记忆
-- 评测集与回归集
+- 核心消息结构保持稳定。
+- provider 负责格式转换。
+- provider registry 负责发现、标签和默认行为。
+- 业务模块不依赖某个供应商的私有字段。
 
-## 9. 我建议参考的框架与原因
+## 6. 适合迁移到其他 Agent 项目的经验
 
-下面这部分带有“选型建议”属性，属于我结合你的场景做的工程推断；框架信息已在 **2026-04-18** 查阅各自官方文档。
+### 6.1 把 Agent 设计成“运行系统”，不是“聊天入口”
 
-### 9.1 第一参考：OpenHarness 本身
+一个可靠 Agent 至少需要：
 
-最适合学习的是它的“底座思路”，不是直接照搬业务。
+- 可执行的工具层。
+- 可治理的权限层。
+- 可恢复的状态层。
+- 可扩展的能力层。
+- 可观察的事件层。
+- 可替换的模型层。
 
-最值得抄的模块：
+只做聊天入口，短期容易出 demo，长期难以沉淀能力。
 
-- runtime 装配
-- agent loop
-- tool registry
-- permissions
-- hooks
-- MCP adapter
-- tasks
-- session / compact / resume
+### 6.2 每个模块都要有自己的“不负责”
 
-如果你要自己做一个可控 Agent 后端，这个仓库本身就是很好的架构参考。
+好的模块拆分不只是定义职责，也要定义边界：
 
-### 9.2 第二参考：PydanticAI
+- Engine 不负责业务工具细节。
+- Tool 不负责权限策略。
+- Hook 不负责主流程决策。
+- Skill 不负责执行副作用。
+- Plugin 不绕过核心治理。
+- UI 不持有业务状态。
+- Provider 不影响业务语义。
+- Memory 不保存无筛选的全部上下文。
 
-适合你如果：
+这些“不负责”比职责列表更能防止系统腐化。
 
-- 想用 Python
-- 希望工具与输出强类型
-- 希望 structured output 很稳
-- 想渐进式从单 Agent 升级到 multi-agent
+### 6.3 用统一执行链路降低扩展成本
 
-官方文档强调了 5 种复杂度层级，从单 Agent、代理委派、程序化 handoff、graph 控制流，到 deep agents；并且提供 durable execution 能力。  
-参考：
+扩展越多，越需要统一入口。  
+如果每种能力都有自己的执行方式，就会出现安全、日志、错误处理和测试的分裂。
 
-- [PydanticAI Multi-Agent Patterns](https://pydantic.dev/docs/ai/guides/multi-agent-applications/)
-- [PydanticAI Durable Execution](https://pydantic.dev/docs/ai/integrations/durable_execution/overview/)
+更稳的策略是：
 
-我的判断：如果你要做“证据对象 + 结构化输出 + Python 后端”，它非常合适。
+- 所有动作都先变成工具。
+- 所有工具都走同一条校验、权限、hook、执行、记录链路。
+- 所有外部服务都先适配，再进入工具注册表。
+- 所有 UI 都消费同一种事件模型。
 
-### 9.3 第三参考：LangGraph
+### 6.4 状态必须被设计，而不是顺手保存
 
-适合你如果：
+Agent 项目常见问题是“什么都放聊天记录里”。  
+更可迁移的做法是给状态分类型：
 
-- 需要长流程、可恢复、可中断
-- 需要 human-in-the-loop
-- 需要明确 state graph
-- 需要调查流程是“有状态工作流”，不是单轮工具调用
+- 意图状态：当前目标、下一步、未解决问题。
+- 观察状态：读过的文件、外部查询、工具结果摘要。
+- 工作状态：待办、后台任务、子 Agent 进度。
+- 验证状态：已运行检查、已确认事实、已知风险。
+- 记忆状态：跨会话仍有用的规则和偏好。
 
-官方文档把 LangGraph定位成 low-level orchestration framework，重点能力就是 durable execution、persistence、human-in-the-loop。  
-参考：
+不同状态有不同保留周期和展示方式，不能全部混在 prompt 里。
 
-- [LangGraph Overview](https://docs.langchain.com/oss/python/langgraph/overview)
-- [LangGraph Persistence](https://docs.langchain.com/oss/python/langgraph/persistence)
+### 6.5 多入口共享内核
 
-我的判断：如果你的审查流程要支持“暂停调查、人工补证、继续执行”，LangGraph 会比纯 prompt loop 更合适。
+CLI、TUI、HTTP、Slack、飞书、Telegram 等入口只是 transport。  
+它们可以有不同交互体验，但不应该拥有不同的 Agent 语义。
 
-### 9.4 第四参考：OpenAI Agents SDK
+迁移到新项目时，应优先设计：
 
-适合你如果：
+- 一个核心 Runtime。
+- 一个核心 Engine。
+- 一套工具治理链路。
+- 多个薄入口适配器。
 
-- 你准备深度使用 OpenAI 生态
-- 想使用 hosted tools
-- 想利用 handoffs / agents-as-tools / results/state / guardrails / traces
-- 想把工具、编排、评测都放在同一套官方语义里
+这样入口越多，系统复用率越高。
 
-官方资料里明确把能力分成：agent definitions、orchestration、guardrails、results/state、integrations/observability、evaluation；还支持 file search。  
-参考：
+### 6.6 测试应围绕契约和不变量
 
-- [OpenAI Agents SDK Overview](https://developers.openai.com/api/docs/guides/agents)
-- [OpenAI Agents SDK Agent Orchestration](https://openai.github.io/openai-agents-python/multi_agent/)
-- [OpenAI File Search](https://developers.openai.com/api/docs/guides/tools-file-search)
+Agent 项目的测试不应只验证“模型回答像不像”。  
+更应该验证：
 
-我的判断：如果你要“一个 manager agent 控最终回答，多个 specialist 做 bounded subtask”，官方文档里的 `agents as tools` 模式非常适合你的场景。
+- 工具 schema 是否稳定。
+- 权限模式是否按预期阻断或放行。
+- hooks 是否能拦截和记录。
+- provider adapter 是否生成统一消息。
+- 会话恢复是否保留关键状态。
+- 压缩后是否保留任务骨架。
+- 外部服务失败是否被规范化表达。
+- UI 协议事件是否完整。
 
-### 9.5 第五参考：AutoGen
+这些测试不会保证模型永远正确，但能保证 Harness 不把错误放大。
 
-适合你如果：
+## 7. 常见反模式
 
-- 你一开始就确定要做复杂多 Agent
-- 系统偏事件驱动
-- 需要更强的异步消息与分布式扩展
+### 7.1 用超长 prompt 替代工具层
 
-AutoGen Core 官方文档强调 actor model、asynchronous messaging、distributed/scalable/resilient agent systems。  
-参考：
+表现：
 
-- [AutoGen Core](https://microsoft.github.io/autogen/stable/user-guide/core-user-guide/index.html)
+- 所有规则都写进系统提示。
+- 模型被要求自己检索、计算、判断和记录。
+- 没有结构化证据，也没有可复查动作。
 
-我的判断：它更适合复杂多智能体系统，不一定是你这个项目的最佳起步点，但适合后期进化。
+后果：
 
-### 9.6 第六参考：CrewAI
+- 难以测试。
+- 难以审计。
+- 长任务容易遗忘。
+- 换模型后行为漂移严重。
 
-适合你如果：
+### 7.2 让工具自己处理权限
 
-- 你更想快速搭建“flow + crew”式工作流
-- 你想先快速出一个多 Agent 业务样机
-- 你接受更强的框架意见
+表现：
 
-官方文档主打 crews、flows、guardrails、memory、knowledge、observability。  
-参考：
+- 每个工具内部各自判断是否安全。
+- 某些工具忘记加限制。
+- 新工具绕过审批和审计。
 
-- [CrewAI Docs](https://docs.crewai.com/)
+后果：
 
-我的判断：适合快速搭 demo 或流程编排，但如果你非常在意底层可控性，可能不如 OpenHarness / PydanticAI / LangGraph 那样贴合“证据型系统”的长期演进。
+- 安全策略碎片化。
+- 权限模式无法全局切换。
+- 审计结果不完整。
 
-## 10. 针对你的场景，我会怎么选
+### 7.3 外部服务直接进入主流程
 
-### 方案 A：最推荐的务实路线
+表现：
 
-- 后端框架：常规 Python API 服务
-- Agent 层：`PydanticAI` 或 `OpenAI Agents SDK`
-- 工作流层：先不用复杂 graph
-- 存储层：关系库 + 向量索引 + 对象存储
-- 证据层：结构化 fact/evidence/case
-- 任务层：异步预处理与比对任务
+- Agent Loop 直接知道某个外部服务的细节。
+- 服务断开导致核心流程异常。
+- 无法把外部工具和本地工具统一治理。
 
-适合：
+更好的做法：
 
-- 尽快做出可信的 V1
-- 强调证据闭环
-- 先把工具层做稳
+- 外部服务由 manager 维护连接。
+- 通过 adapter 转成统一工具。
+- 断连和错误被规范化为工具结果。
 
-### 方案 B：如果你明确要“可暂停、可恢复、人工复核后继续”
+### 7.4 过早多 Agent
 
-- 后端框架：常规 Python API 服务
-- Agent / 工作流：`LangGraph`
-- 工具：本地 tool / MCP / 检索服务
-- 状态：thread + checkpoint + case store
+表现：
 
-适合：
+- 还没有清晰工具和状态，就让多个 Agent 分头行动。
+- 子 Agent 输出不可验证。
+- 多个 Agent 同时写同一区域。
 
-- 调查过程长
-- 审核人会多次介入
-- 需要流程级恢复
+后果：
 
-### 方案 C：如果你要一个更像 OpenHarness 的“Agent 平台”
+- 结果冲突。
+- 调试困难。
+- 责任不清。
 
-- 仿照 OpenHarness 自建 harness
-- 保留 runtime / tools / permissions / hooks / tasks / session / compact
-- 在上面挂你的审查业务工具
+### 7.5 把 UI 当业务层
 
-适合：
+表现：
 
-- 你不只是做一个投标审查项目
-- 你未来还会做别的 Agent 业务
-- 你要的是“平台底座”，不是“单个 workflow”
+- CLI、TUI、远程聊天渠道各自实现流程。
+- 权限弹窗、任务状态、工具结果在不同入口行为不一致。
 
-## 11. 我建议你直接复用的一套目录结构
+后果：
 
-```text
-src/
-  app/
-    api.py
-    dependencies.py
-  agent/
-    runtime.py
-    prompts.py
-    state.py
-    orchestrator.py
-    tools/
-      doc_search.py
-      entity_extract.py
-      section_compare.py
-      price_rules.py
-      graph_query.py
-      case_store.py
-      report_writer.py
-    workflows/
-      single_investigator.py
-      review_loop.py
-  domain/
-    documents/
-      models.py
-      ingest.py
-      chunking.py
-    evidence/
-      models.py
-      builder.py
-      scoring.py
-    detectors/
-      text_similarity.py
-      template_fingerprint.py
-      shared_entities.py
-      quote_anomalies.py
-  infra/
-    storage/
-    vector/
-    db/
-    queue/
-    mcp/
-  tasks/
-    preprocess_project.py
-    rebuild_indices.py
-  evals/
-    golden_cases/
-    runners/
-  tests/
-```
+- 功能无法复用。
+- Bug 修复需要多处同步。
+- 新渠道接入成本过高。
 
-这套结构的原则是：
+## 8. 面向新 Agent 项目的架构取舍表
 
-- `agent/` 负责编排
-- `domain/` 负责业务模型与规则
-- `infra/` 负责技术底座
-- `tasks/` 负责重处理
-- `evals/` 负责回归质量
+| 设计问题 | 优先选择 | 何时换方案 |
+| --- | --- | --- |
+| 规则写 prompt 还是做工具 | 可重复、可验证、需外部访问的能力做工具 | 只涉及表达风格或一次性解释时用 prompt |
+| 能力做内置工具还是 MCP | 核心本地动作做内置工具 | 独立服务、企业系统、跨项目能力用 MCP 或外部 adapter |
+| 逻辑放 hook 还是 tool | 审计、拦截、通知放 hook | 产生业务结果或改变主流程时放 tool |
+| 先做单 Agent 还是多 Agent | 默认单 Agent 加强工具层 | 子任务独立、可验证、并行收益明确时拆多 Agent |
+| 状态放聊天记录还是持久层 | 临时推理放聊天记录 | 会被恢复、审计、复用的状态进入持久层 |
+| UI 直接调用工具还是调用 Engine | UI 调 Engine 或 Runtime | 只有纯管理后台动作才可绕过 Agent Loop |
+| provider 逻辑放业务里还是 adapter | 放 provider adapter | 业务确实依赖某模型独有能力时，也要隔离为能力开关 |
+| 长任务同步等结果还是后台化 | 默认后台化并提供状态查询 | 极短、无副作用、无需进度反馈的任务可同步 |
 
-## 12. 最后给你的结论
+## 9. 给后续 Agent 项目的设计指导原则
 
-如果你下一个项目要做：
+这一节把前面的方法论转化为可执行指导，适用于新 Agent 项目的架构设计、模块拆分、协作关系设计和方案取舍。
 
-> 上传多个投标文件 markdown，让 agent 结合多个工具自主检查并输出串标围标风险结果
+### 9.1 架构设计原则
 
-那么最好的路线不是“做一个会聊天的 Agent”，而是：
+1. 先定义 Agent 的动作边界，再写系统提示词。
+2. 把模型视为决策者，把 Harness 视为执行系统。
+3. 所有可执行动作必须经过统一工具契约。
+4. 所有工具调用必须经过统一治理链路。
+5. Runtime 必须成为唯一组合根，避免入口各自初始化依赖。
+6. Provider、UI、外部服务都属于边界适配，不应污染核心业务语义。
+7. 长任务必须有状态、进度、输出和终止机制。
+8. 长上下文必须通过状态分层解决，不要只依赖更大的上下文窗口。
 
-1. 先做一个证据驱动的文档审查系统
-2. 把抽取、检索、比对、规则、归档做成工具
-3. 让 Agent 站在工具之上做调查与解释
-4. 最终输出 case + evidence + risk level + uncertainty
-5. 对高风险结论保留人工复核
+### 9.2 模块拆分原则
 
-OpenHarness 给你的最大启发不是某个单独模块，而是这一整套分层思想：
+新项目可以按以下职责拆分，而不必照搬本项目目录：
 
-- Agent loop 要薄
-- 工具要强
-- 权限要独立
-- 状态要持久
-- 外部能力要适配
-- 业务结论要证据化
+- `runtime`：装配配置、模型、工具、权限、hooks、外部服务和会话。
+- `engine`：维护消息、事件和工具循环。
+- `tools`：封装所有可执行能力，提供 schema、只读语义和规范化结果。
+- `policy`：集中处理权限、敏感资源、人工确认和执行模式。
+- `hooks`：承载审计、拦截、通知、旁路验证等横切逻辑。
+- `memory`：管理会话快照、压缩摘要、近期工作状态和持久记忆。
+- `extensions`：管理技能、插件、外部能力包和按需知识。
+- `tasks`：管理后台任务、子 Agent、长耗时流程和输出读取。
+- `providers`：屏蔽模型供应商差异。
+- `interfaces`：承接 CLI、TUI、HTTP、聊天渠道等入口。
+- `tests`：覆盖工具契约、权限不变量、状态恢复、事件协议和 adapter 行为。
 
-如果你只记住一句话，我建议记这句：
+拆分时保持一个方向：边界模块依赖核心契约，核心契约不要反向依赖具体入口或供应商。
 
-> **高风险 Agent 项目，核心不是“让模型更聪明”，而是“让证据链、工具链、状态链足够可靠”。**
+### 9.3 协作关系设计原则
+
+设计协作关系时，优先写出这几条链路：
+
+1. 用户输入如何进入 Runtime 和 Engine。
+2. 模型如何看到工具 schema。
+3. 工具请求如何被校验、授权、执行和记录。
+4. 工具结果如何回填给模型。
+5. 长任务如何变成可查询状态。
+6. 会话如何保存、恢复和压缩。
+7. 外部服务如何被适配成统一工具。
+8. UI 或渠道如何消费事件，而不是复制业务流程。
+
+如果某个模块同时出现在多条链路中，要检查它是“核心契约”还是“边界适配”。  
+核心契约应保持小而稳定，边界适配可以变化更快。
+
+### 9.4 方案取舍原则
+
+做设计决策时，可以使用以下判断句：
+
+- 如果能力需要被审计，就不要只写在 prompt 里。
+- 如果能力会产生副作用，就必须经过权限层。
+- 如果能力来自外部系统，就先做 adapter，再进入工具注册。
+- 如果信息会影响后续行动，就不要只留在自然语言对话里。
+- 如果任务会超过一次交互，就设计会话恢复和状态摘要。
+- 如果任务会运行很久，就设计后台任务和进度读取。
+- 如果要支持多个入口，就先稳定核心 Engine 和事件协议。
+- 如果要支持多个模型，就先稳定 provider 抽象和消息模型。
+- 如果子任务无法验收，就不要拆给子 Agent。
+- 如果 hook 开始承载业务结果，就把它升级为显式工具或服务。
+
+### 9.5 建议落地顺序
+
+1. 最小 Agent Loop：能接收用户输入、调用模型、识别工具请求、回填结果。
+2. 工具契约：先实现少量高价值工具，并统一 schema、结果和错误表达。
+3. 权限治理：把只读、写入、命令、敏感资源和人工确认纳入同一执行链路。
+4. 会话状态：保存消息、近期工作状态、关键观察和恢复入口。
+5. 事件协议：让 UI 能展示文本增量、工具执行、错误、权限请求和任务进度。
+6. 扩展机制：引入 skills、plugins 或外部 adapter，让能力增长不改核心循环。
+7. 长任务机制：把耗时工作后台化，并提供查询、停止、读取输出的工具。
+8. 多 Agent 协作：在工具和状态稳定后，再拆出可验证的专业子任务。
+9. 多入口接入：最后扩展 CLI、TUI、HTTP 或聊天渠道，共享同一个运行内核。
+
+### 9.6 验证原则
+
+每次扩展 Agent 能力时，至少验证四件事：
+
+- 模型能否发现并正确请求该能力。
+- Harness 能否校验、授权、执行并记录该能力。
+- 失败时是否有可理解、可恢复的错误表达。
+- 会话压缩、恢复或换入口后，关键状态是否仍然存在。
+
+这比单纯观察一次模型回答更可靠。  
+Agent 项目的质量最终取决于 Harness 是否能在模型不稳定、工具失败、上下文压缩、入口变化和外部服务波动时仍保持边界清晰。
